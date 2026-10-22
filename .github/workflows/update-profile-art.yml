@@ -8,8 +8,9 @@ on:
 permissions:
   contents: write
 
+# Keep two profile-art runs from pushing generated files at the same time.
 concurrency:
-  group: update-profile-art
+  group: update-profile-art-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
@@ -19,6 +20,9 @@ jobs:
     steps:
       - name: Check out profile repository
         uses: actions/checkout@v7
+        with:
+          # Rebase needs the branch history when main advances while this job runs.
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v7
@@ -36,14 +40,44 @@ jobs:
       - name: Render contribution SVG
         run: python scripts/render_heatmap_svg.py
 
-      - name: Commit refreshed data and SVG if changed
+      - name: Commit and safely push refreshed data and SVG
+        shell: bash
         run: |
+          set -euo pipefail
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add data/contributions.json contrib-heatmap.svg
+
           if git diff --cached --quiet; then
             echo "Contribution art has no changes."
-          else
-            git commit -m "chore: refresh contribution heatmap [skip ci]"
-            git push
+            exit 0
           fi
+
+          git commit -m "chore: refresh contribution heatmap [skip ci]"
+          BRANCH="${GITHUB_REF_NAME}"
+
+          # The remote may receive a README/workflow edit while this job runs.
+          # Fetch and rebase before pushing; never force-push over user changes.
+          for attempt in 1 2 3; do
+            echo "Syncing with origin/${BRANCH} (attempt ${attempt}/3)..."
+            git fetch origin "${BRANCH}"
+
+            if ! git rebase "origin/${BRANCH}"; then
+              git rebase --abort || true
+              echo "::error::Rebase conflict. Remote history was preserved; inspect recent commits and rerun the workflow from the latest main."
+              exit 1
+            fi
+
+            if git push origin "HEAD:${BRANCH}"; then
+              echo "Contribution art pushed successfully."
+              exit 0
+            fi
+
+            echo "Push did not succeed; will fetch and retry."
+            if [ "$attempt" -lt 3 ]; then
+              sleep 2
+            fi
+          done
+
+          echo "::error::Could not push after 3 attempts. No force-push was attempted. Rerun from the latest branch, and inspect any permission or conflict errors."
+          exit 1
